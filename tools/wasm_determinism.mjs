@@ -21,6 +21,8 @@
 //   --emit FILE     write a golden hash-per-checkpoint file (cross-process check)
 //   --compare FILE  compare this run against a previously emitted golden file
 //   --wasm PATH     wasm module path (default build/wasm/pokeemerald.wasm)
+//   --diverge-at N  negative control: perturb instance 1's input at frame N;
+//                   the run MUST then report divergence (proves the test works)
 //
 // Exit code 0 = deterministic, 1 = divergence detected / mismatch.
 
@@ -35,11 +37,21 @@ const PAL = 0x05000000;
 const VRAM = 0x06000000;
 const OAM = 0x07000000;
 
-// Work RAM: this is where ALL mutable game-logic state lives. If these regions
-// match frame-for-frame, the entire game simulation is identical.
-const REGIONS = {
-  EWRAM: { base: 0x02000000, size: 0x40000 }, // 256 KiB external work RAM
-  IWRAM: { base: 0x03000000, size: 0x08000 }, //  32 KiB internal work RAM
+// NOTE on where state lives: this is a wasm32 recompile, not a GBA-address
+// emulator. wasm-ld places all C globals (gMain, gTasks, gSprites, the game's
+// gHeap malloc arena, the save blocks, ...) in the LOW data/bss section of
+// linear memory — NOT at GBA hardware addresses 0x02000000/0x03000000. The
+// EWRAM_DATA/COMMON_DATA section attributes don't relocate under wasm. So the
+// complete mutable game state is exactly [0, __data_end), which includes the
+// static heap. Hashing that range == fingerprinting the whole simulation.
+//
+// Hardware-mapped regions (VRAM/PAL/OAM/IO) ARE at their GBA addresses inside
+// the 256 MiB linear memory and are display/IO surfaces, derived from the
+// state above — we hash them separately as a secondary signal.
+const HW_REGIONS = {
+  PAL: { base: 0x05000000, size: 0x400 },
+  VRAM: { base: 0x06000000, size: 0x18000 },
+  OAM: { base: 0x07000000, size: 0x400 },
 };
 
 const buttons = {
@@ -151,6 +163,16 @@ function fnv1a(bytes) {
   return h >>> 0;
 }
 
+// FNV-1a over 32-bit words (4x fewer iterations; same fingerprinting power).
+function fnv1aWords(words) {
+  let h = 2166136261;
+  for (let i = 0; i < words.length; i++) {
+    h = Math.imul(h ^ (words[i] & 0xffff), 16777619);
+    h = Math.imul(h ^ (words[i] >>> 16), 16777619);
+  }
+  return h >>> 0;
+}
+
 function hex(n) { return (n >>> 0).toString(16).padStart(8, '0'); }
 
 // --- one instance -------------------------------------------------------------
@@ -164,18 +186,25 @@ async function createInstance(module) {
 
   inst.exports.AgbMain();
 
+  // [0, __data_end) is the entire static data + bss + game heap = full state.
+  const dataEnd = inst.exports.__data_end.value >>> 0;
+
   return {
     exports: inst.exports,
+    dataEnd,
     setKeys(keyMask) { u16()[KEYINPUT >> 1] = KEY_MASK ^ (keyMask & KEY_MASK); },
     runFrame() { inst.exports.WasmRunFrame(); },
-    regionHash(name) {
-      const { base, size } = REGIONS[name];
+    // Full game-state fingerprint: every C global + the malloc arena.
+    stateHash() {
+      return fnv1aWords(new Uint32Array(inst.exports.memory.buffer, 0, dataEnd >> 2));
+    },
+    hwHash(name) {
+      const { base, size } = HW_REGIONS[name];
       return fnv1a(new Uint8Array(inst.exports.memory.buffer, base, size));
     },
-    stateHash() {
-      // Combined work-RAM hash = full game-logic state fingerprint.
+    videoHash() {
       let h = 0;
-      for (const name of Object.keys(REGIONS)) h = (Math.imul(h ^ this.regionHash(name), 16777619)) >>> 0;
+      for (const name of Object.keys(HW_REGIONS)) h = Math.imul(h ^ this.hwHash(name), 16777619) >>> 0;
       return h >>> 0;
     },
   };
@@ -193,7 +222,7 @@ function scriptedKeyMask(frame) {
 }
 
 function parseArgs(argv) {
-  const o = { frames: 2000, instances: 2, wasm: 'build/wasm/pokeemerald.wasm', emit: null, compare: null };
+  const o = { frames: 2000, instances: 2, wasm: 'build/wasm/pokeemerald.wasm', emit: null, compare: null, divergeAt: -1 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--frames') o.frames = Number(argv[++i]);
@@ -201,6 +230,9 @@ function parseArgs(argv) {
     else if (a === '--wasm') o.wasm = argv[++i];
     else if (a === '--emit') o.emit = argv[++i];
     else if (a === '--compare') o.compare = argv[++i];
+    // Negative control: feed instance 1 a different button on this one frame.
+    // The run MUST then report divergence — proves the detector has teeth.
+    else if (a === '--diverge-at') o.divergeAt = Number(argv[++i]);
     else { console.error(`unknown arg: ${a}`); process.exit(2); }
   }
   return o;
@@ -219,55 +251,67 @@ async function main() {
   const instances = [];
   for (let i = 0; i < opts.instances; i++) instances.push(await createInstance(module));
 
+  console.log(`state region: [0, 0x${instances[0].dataEnd.toString(16)}) = ${(instances[0].dataEnd / 1048576).toFixed(1)} MiB`);
+
   // Sanity: post-boot state must already match across instances.
   const bootHashes = instances.map((x) => x.stateHash());
   console.log(`post-boot stateHash: ${bootHashes.map(hex).join(' ')}`);
 
-  const checkpoints = [];        // [{ frame, hash, ewram, iwram }]
+  const checkpoints = [];        // [{ frame, hash, video }]
   const checkpointEvery = Math.max(1, Math.floor(opts.frames / 40));
   let firstDivergeFrame = -1;
   let firstDivergeDetail = null;
+  const distinctStateHashes = new Set();
+  const distinctVideoHashes = new Set();
 
   for (let frame = 0; frame < opts.frames; frame++) {
     const keyMask = scriptedKeyMask(frame);
-    for (const x of instances) { x.setKeys(keyMask); x.runFrame(); }
+    for (let i = 0; i < instances.length; i++) {
+      // Optional perturbation for the negative control.
+      const k = (i === 1 && frame === opts.divergeAt) ? buttons.right : keyMask;
+      instances[i].setKeys(k);
+      instances[i].runFrame();
+    }
 
     // Cross-check every frame (cheap relative to a frame of game logic).
     const h0 = instances[0].stateHash();
+    const v0 = instances[0].videoHash();
+    distinctStateHashes.add(h0);
+    distinctVideoHashes.add(v0);
     for (let i = 1; i < instances.length; i++) {
-      if (instances[i].stateHash() !== h0 && firstDivergeFrame === -1) {
+      if (firstDivergeFrame === -1 && (instances[i].stateHash() !== h0 || instances[i].videoHash() !== v0)) {
         firstDivergeFrame = frame;
         firstDivergeDetail = {
           instance: i,
-          ewram: [instances[0].regionHash('EWRAM'), instances[i].regionHash('EWRAM')],
-          iwram: [instances[0].regionHash('IWRAM'), instances[i].regionHash('IWRAM')],
+          state: [h0, instances[i].stateHash()],
+          video: [v0, instances[i].videoHash()],
         };
       }
     }
 
     if (frame % checkpointEvery === 0 || frame === opts.frames - 1) {
-      checkpoints.push({
-        frame,
-        hash: h0,
-        ewram: instances[0].regionHash('EWRAM'),
-        iwram: instances[0].regionHash('IWRAM'),
-      });
+      checkpoints.push({ frame, hash: h0, video: v0 });
     }
   }
 
-  console.log('\n--- checkpoints (frame: combined / EWRAM / IWRAM) ---');
+  console.log('\n--- checkpoints (frame: stateHash / videoHash) ---');
   for (const c of checkpoints) {
-    console.log(`${String(c.frame).padStart(5)}: ${hex(c.hash)} / ${hex(c.ewram)} / ${hex(c.iwram)}`);
+    console.log(`${String(c.frame).padStart(5)}: ${hex(c.hash)} / ${hex(c.video)}`);
+  }
+
+  // Liveness: if state/video never change, the test is vacuous. They MUST vary.
+  console.log(`\ndistinct state hashes over run: ${distinctStateHashes.size}, distinct video hashes: ${distinctVideoHashes.size}`);
+  if (distinctStateHashes.size < 2) {
+    console.log('⚠️  game state never changed — emulation may not be advancing; determinism result is not meaningful.');
   }
 
   let ok = true;
 
   if (firstDivergeFrame !== -1) {
     ok = false;
-    console.log(`\n❌ IN-PROCESS DIVERGENCE at frame ${firstDivergeFrame}`);
-    console.log(`   instance 0 vs ${firstDivergeDetail.instance}`);
-    console.log(`   EWRAM ${firstDivergeDetail.ewram.map(hex).join(' vs ')}`);
-    console.log(`   IWRAM ${firstDivergeDetail.iwram.map(hex).join(' vs ')}`);
+    console.log(`\n❌ IN-PROCESS DIVERGENCE at frame ${firstDivergeFrame} (instance 0 vs ${firstDivergeDetail.instance})`);
+    console.log(`   state ${firstDivergeDetail.state.map(hex).join(' vs ')}`);
+    console.log(`   video ${firstDivergeDetail.video.map(hex).join(' vs ')}`);
   } else if (opts.instances > 1) {
     console.log(`\n✅ ${opts.instances} instances stayed bit-identical for all ${opts.frames} frames`);
   }
