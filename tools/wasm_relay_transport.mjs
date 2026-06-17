@@ -50,6 +50,15 @@ export class RelayTransport {
     this.disconnected = false;
     this._syncSeen = false;
     this._syncWaiter = null;
+    // M3 desync detection: a per-checkpoint hash side channel. Each peer posts
+    // its rolling transcript hash for checkpoint `key`; when both peers' hashes
+    // for the same key are in hand they are compared. A mismatch records
+    // `desync` (and never clears) so the drivers can surface a clear alarm.
+    this.localHashes = new Map();  // key -> our hash, until the peer's arrives
+    this.peerHashes = new Map();   // key -> peer's hash, until ours arrives
+    this.desync = null;            // {key, local, peer} on first mismatch
+    this._finishAcked = false;
+    this._finishAckWaiter = null;
     ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
     ws.onclose = () => this._fail('relay closed');
     ws.onerror = () => this._fail('relay error');
@@ -68,9 +77,44 @@ export class RelayTransport {
     } else if (m.type === 'sync') {
       this._syncSeen = true;
       if (this._syncWaiter) { const w = this._syncWaiter; this._syncWaiter = null; w(); }
+    } else if (m.type === 'hash') {
+      this.peerHashes.set(m.key, m.hash >>> 0);
+      this._compare(m.key);
+    } else if (m.type === 'finishAck') {
+      this._finishAcked = true;
+      if (this._finishAckWaiter) { const w = this._finishAckWaiter; this._finishAckWaiter = null; w(); }
     } else if (m.type === 'peerGone') {
       this._fail('peer disconnected');
     }
+  }
+
+  // --- M3 desync detector ---------------------------------------------------
+  // Post this peer's transcript hash for checkpoint `key` and compare against
+  // the peer's once it arrives (ordering is irrelevant: whichever side lands
+  // second triggers the compare).
+  checkpointHash(key, hash) {
+    hash = hash >>> 0;
+    this.localHashes.set(key, hash);
+    this._post({ type: 'hash', key, hash });
+    this._compare(key);
+  }
+
+  _compare(key) {
+    if (!this.localHashes.has(key) || !this.peerHashes.has(key)) return;
+    const local = this.localHashes.get(key);
+    const peer = this.peerHashes.get(key);
+    this.localHashes.delete(key);
+    this.peerHashes.delete(key);
+    if (local !== peer && !this.desync) this.desync = { key, local, peer };
+  }
+
+  // End-of-run handshake so a clean run can prove EVERY checkpoint was compared:
+  // the master awaits the slave's ack, and WebSocket per-peer ordering guarantees
+  // all of the slave's hash messages (sent before its ack) have already arrived.
+  finishAck() { this._post({ type: 'finishAck' }); }
+  awaitFinishAck() {
+    if (this._finishAcked || this.disconnected) return Promise.resolve();
+    return new Promise((res) => { this._finishAckWaiter = res; });
   }
 
   // Startup barrier: ensures both peers' transports are attached and listening
@@ -88,6 +132,7 @@ export class RelayTransport {
     const err = new Error(`relay transport: ${reason}`);
     for (const r of this.pendingWord.values()) r(Promise.reject(err));
     this.pendingWord.clear();
+    if (this._finishAckWaiter) { const w = this._finishAckWaiter; this._finishAckWaiter = null; w(); }
     this._pushEvent({ kind: 'error', error: err });
   }
 

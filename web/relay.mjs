@@ -15,8 +15,10 @@
 //   relay  -> client {type:'ready'}                 sent to all once room is full
 //   client -> relay  {type:'xfer', seq, word}       a staged serial word
 //   client -> relay  {type:'frameEnd', frame}       end of a frame's transfers
+//   client -> relay  {type:'hash', key, hash}       M3 desync checkpoint hash
+//   client -> relay  {type:'finishAck'}             M3 end-of-run ack
 //   client -> relay  {type:'bye'}                   leave
-//   relay  -> client (xfer/frameEnd are forwarded verbatim with `from` added)
+//   relay  -> client (gameplay msgs are forwarded verbatim with `from` added)
 //   relay  -> client {type:'peerGone', playerId}    a peer disconnected
 
 import { createHash } from 'node:crypto';

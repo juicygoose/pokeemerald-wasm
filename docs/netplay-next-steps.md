@@ -12,13 +12,14 @@ verifiable.
 |---|---|
 | M1 — Reusable SIO bus module | ✅ done |
 | M2 — WebSocket relay transport | ✅ done |
-| M3 — Desync detection | ⬜ next (seeded by M2's per-frame seq tripwire) |
-| M4 — Browser integration | ⬜ |
+| M3 — Desync detection | ✅ done |
+| M4 — Browser integration | ⬜ next |
 | M5 — Drive from the in-game Cable Club | ⬜ |
 | M6 — Hardening | ⬜ |
 
 The link cable now works in-process (M1) and across two OS processes over real
-WebSockets (M2), both with no game-code changes. Run them with the commands in
+WebSockets (M2), both with no game-code changes, and a lockstep desync detector
+(M3) catches any divergence between peers. Run them with the commands in
 [Reproduce the prototypes](#reproduce-the-prototypes).
 
 ## Guiding constraints
@@ -83,18 +84,43 @@ same `Transport` seam is what M2's relay and M4's browser session plug into.
   and the master's 64-byte block arrives intact at the slave. Strict lockstep
   (0 input-delay); the latency/input-delay buffer is left to M6 tuning.
 
-### M3 — Desync detection
-Every K frames, exchange a truncated `stateHash()` (already implemented) over a
-side channel and compare. On mismatch, surface a clear "desync" error rather
-than silently diverging. **Verify:** intentionally perturb one client's input
-and confirm the desync alarm fires (the determinism harness's `--diverge-at`
-already demonstrates the detector logic).
+### M3 — Desync detection ✅ done
+Every K frames each peer samples a checksum over a side channel and compares; on
+mismatch it raises a clear "desync" error instead of silently diverging.
+
+What's checksummed is the **serial transcript**, not the full `stateHash()`. The
+two peers are different players (different names, link ids, `isMaster`), so their
+full game states legitimately differ — a full-state compare would always
+"mismatch". The shared truth is instead the wire: every transfer's 4-slot RECV
+vector (slot i = player i's word) is bit-identical on every peer, so a rolling
+FNV-1a of every applied RECV word (`SioBus.transcript`,
+[`tools/wasm_sio_bus.mjs`](../tools/wasm_sio_bus.mjs)) is identical across peers
+exactly while they stay in lockstep. This catches wrong word *values*, strictly
+stronger than M2's per-frame transfer-*count* tripwire.
+
+- `RelayTransport.checkpointHash(key, hash)` posts a `{type:'hash'}` over the
+  relay (forwarded verbatim — no relay change) and compares against the peer's
+  for the same `key`; the first mismatch records `transport.desync` and the
+  drivers surface it. A `finishAck` handshake lets a clean run prove every
+  checkpoint was compared (per-peer socket ordering guarantees all hashes
+  arrived before the ack).
+- `tools/wasm_relay_client.mjs --mode desync` drives the established link in
+  strict lockstep and samples every 16 frames; `--corrupt-at F` is the negative
+  control (the slave flips one bit of its transcript hash at checkpoint `F`).
+- **Verified:** `node tools/wasm_link_desync.mjs` runs two scenarios — a clean
+  run stays in sync across all 19 checkpoints (detector quiet), and the negative
+  control fires the desync alarm on **both** peers at checkpoint 160. The
+  determinism harness's `--diverge-at` independently demonstrates the same
+  detector logic against real state divergence in-process.
 
 ### M4 — Browser integration (`web/app.js`)
 - Add the SIO shim around `WasmRunFrame()`: read this peer's
   `REG_SIOMLT_SEND`, push to the transport, await peers, deliver `RECV`, call
   `SerialCB`. Gate it on an "online" mode so single-player is unaffected.
 - Minimal connect UI (host/join a room code).
+- Reuse M3 directly: the browser session holds a `SioBus` + `RelayTransport`, so
+  it can call `transport.checkpointHash(frame, bus.transcript)` on the same
+  cadence to get desync detection in the tab for free.
 - **Verify:** two browser tabs reach `CONN_ESTABLISHED` and exchange a block,
   mirroring the loopback in-browser.
 
@@ -136,4 +162,5 @@ make wasm
 node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism
 node tools/wasm_link_loopback.mjs                             # M1 in-process bus
 node tools/wasm_link_relay.mjs                                # M2 cross-process relay
+node tools/wasm_link_desync.mjs                               # M3 desync detection
 ```
