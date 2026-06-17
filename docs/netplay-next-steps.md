@@ -14,7 +14,7 @@ verifiable.
 | M2 — WebSocket relay transport | ✅ done |
 | M3 — Desync detection | ✅ done |
 | M4 — Browser integration | ✅ done |
-| M5 — Drive from the in-game Cable Club | ⬜ next |
+| M5 — Drive from the in-game Cable Club | 🔶 spike done — thesis proven; full trade/battle is a browser task |
 | M6 — Hardening | ⬜ |
 
 The link cable now works in-process (M1), across two OS processes over real
@@ -140,11 +140,50 @@ type in `web/server.mjs`).
   `web/netplay.mjs` over the in-process relay): establishment at frame 7, block
   intact, 17 desync checkpoints in sync.
 
-### M5 — Drive from the in-game Cable Club
-Replace the programmatic `OpenLink` bring-up with the real flow: walk to a
-Cable Club table, talk to the attendant, and let the game call `OpenLink`
-itself. The shim just provides the bus. **Verify:** two players, each from a
-loaded save, complete a **link trade** and a **link battle** end to end.
+### M5 — Drive from the in-game Cable Club 🔶 spike done
+Goal: replace the programmatic `OpenLink` bring-up with the real flow — walk to
+a Cable Club, talk to the attendant, let the game call `OpenLink` itself; the
+shim just provides the bus.
+
+**Spike (`tools/wasm_cable_club_spike.mjs`) — what it proved:**
+1. **The transport needs no changes.** Everything M1–M4 built (SioBus, relay,
+   desync) is agnostic to who opens the link.
+2. **The game drives the link itself.** Calling `TryTradeLinkup` (the very
+   `special` the attendant script invokes — see `data/scripts/cable_club.inc` →
+   `src/cable_club.c:610`) under the real overworld loop (`CB2_Overworld` →
+   `RunTasks` → `Task_LinkupStart`) makes the game set `LINKTYPE_TRADE_SETUP`
+   and call `OpenLinkTimed` on its own (verified: `gLinkCallback` is set by game
+   code, not JS). This is exactly M5's thesis.
+3. **The real shim surface beyond `OpenLink` is *running the full game loop*,
+   not new transport code.** M1–M4 silenced the main callback; M5 must let
+   `CB2_Overworld` and the whole field/menu stack run. The cable-club flow is
+   input-driven (A-button confirms, `GetFieldMessageBoxMode`, windows) and uses
+   `OpenLinkTimed` + `GetLinkPlayerDataExchangeStatusTimed` + a trainer-card
+   block exchange + `LinkCB_SendHeldKeys` steady state — all carried by the
+   existing bus.
+
+**New headless infra:** `WasmStartNewGame` (a one-line WASM-only shim in
+`src/main.c`, gated `#if WASM`, like `WasmRunFrame`) jumps straight into a fresh
+game's overworld, skipping the title/Birch menus that need interactive
+navigation. It exists only because JS can't synthesize the C function pointer
+`SetMainCallback2(CB2_NewGame)` needs.
+
+**The boundary / why the rest is a browser task:** triggering linkup needs a
+*clean Cable Club field state*. Forced mid-intro (the new-game truck), the
+game's `Task_LinkupStart` opens the link and then faults in `AddWindow` — the
+field isn't ready to open the cable-club window. Reaching a real Cable Club
+headlessly means playing the entire intro (exit truck → Littleroot → … → a
+Pokémon Center Cable Club in another town, with a party), which can't be
+scripted blindly (confirmed: naive input never even leaves the truck). So:
+
+- **Full link trade + battle is driven in the browser** using M4's online
+  session plus real navigation (two players, each from a loaded save, walk to
+  the attendant). The headless harness stays for transport/link-layer checks.
+- Remaining M5 work (browser): swap the prototype's programmatic bring-up for
+  the attendant flow, route the per-frame `REG_SIOMLT_SEND`/`SerialCB` shim
+  through `WasmRunFrame` while `CB2_Overworld` runs, and hand off to the trade
+  (`CB2_StartCreateTradeMenu`) / battle callbacks. **Verify:** two players
+  complete a link trade and a link battle end to end.
 
 ### M6 — Hardening
 - Latency tuning (input-delay vs. responsiveness), reconnect on transient
@@ -168,7 +207,7 @@ loaded save, complete a **link trade** and a **link battle** end to end.
 |---|---|---|
 | Cross-machine state divergence | Low | Logic is integer-only; add M6 cross-machine check |
 | Latency makes lockstep feel sluggish | Medium | Input-delay buffer; turn-based game is forgiving |
-| Cable Club flow needs more shim surface than `OpenLink` | Medium | M5 spike before committing UI work |
+| Cable Club flow needs more shim surface than `OpenLink` | ~~Medium~~ Retired | M5 spike proved the game drives `OpenLink` itself under the normal loop; the only "extra surface" is running the full game loop (no new transport code) |
 | Relay abuse / room squatting | Low | Room TTLs, max peers, rate limits in M6 |
 
 ## Reproduce the prototypes
@@ -181,4 +220,5 @@ node tools/wasm_link_relay.mjs                                # M2 cross-process
 node tools/wasm_link_desync.mjs                               # M3 desync detection
 node tools/wasm_netplay_check.mjs                             # M4 browser driver (headless)
 node web/server.mjs   # then open http://localhost:8000 in two tabs, same room  # M4 in-browser
+node tools/wasm_cable_club_spike.mjs                          # M5 spike (game-driven link)
 ```
