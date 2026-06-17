@@ -6,6 +6,21 @@ link layer reaches `CONN_ESTABLISHED` and round-trips blocks over a JS-emulated
 serial bus. What remains is engineering, staged so each step is independently
 verifiable.
 
+## Status
+
+| Milestone | State |
+|---|---|
+| M1 — Reusable SIO bus module | ✅ done |
+| M2 — WebSocket relay transport | ✅ done |
+| M3 — Desync detection | ⬜ next (seeded by M2's per-frame seq tripwire) |
+| M4 — Browser integration | ⬜ |
+| M5 — Drive from the in-game Cable Club | ⬜ |
+| M6 — Hardening | ⬜ |
+
+The link cable now works in-process (M1) and across two OS processes over real
+WebSockets (M2), both with no game-code changes. Run them with the commands in
+[Reproduce the prototypes](#reproduce-the-prototypes).
+
 ## Guiding constraints
 
 - **No game-logic changes.** Keep all multiplayer in JS + WASM-only shims, as
@@ -18,30 +33,55 @@ verifiable.
 
 ## Milestones
 
-### M1 — Extract the SIO bus into a reusable module
+### M1 — Extract the SIO bus into a reusable module ✅ done
 Pull the bus emulation out of `tools/wasm_link_loopback.mjs` into a shared
 module with a transport interface:
 
 ```
 class SioBus {
-  stageWord(playerId, word)      // from REG_SIOMLT_SEND
-  exchange() -> word[4]          // deliver RECV slots + call SerialCB on all
+  exchange() -> Promise<word[4]>  // stage local SIOMLT_SEND, swap, deliver RECV,
+                                  // call SerialCB on all local nodes
+  driveFrame() -> Promise<count>  // master-paced batch of exchanges per frame
 }
-interface Transport { send(word); recv() -> Promise<word[]>; }
+interface Transport { send(playerId, word); recv() -> Promise<word[4]>; }
 ```
 
-The loopback becomes a `LocalTransport` (array shuffle). **Verify:** loopback
-test still passes against the refactored module.
+Done in `tools/wasm_sio_bus.mjs`: `LinkNode` (per-console register/struct
+accessors), `SioBus` (transfer + per-frame cadence), `LocalTransport` (the
+loopback's synchronous word shuffle), plus `bootLinkInstance` / `stepFrame`
+shims. `tools/wasm_link_loopback.mjs` is now just the LocalTransport driver +
+verification. **Verified:** loopback still reaches `CONN_ESTABLISHED` (frame 7),
+completes the player-data exchange, and round-trips a 64-byte user block. The
+same `Transport` seam is what M2's relay and M4's browser session plug into.
 
-### M2 — WebSocket relay transport
-- Tiny relay server (extend `web/server.mjs`, or a Cloudflare Worker +
-  Durable Object per `wrangler.toml`) that groups 2–4 peers into a room and
-  forwards one `{frame, playerId, word}` message per transfer.
-- `RelayTransport` implements the interface; the master only advances a frame
-  once all peers' words for that frame have arrived (input-delay buffer of N
-  frames to absorb latency).
-- **Verify:** run two Node clients against the relay and reproduce the M1
-  block round-trip across processes/sockets.
+> Build note: a clean `make wasm` previously failed in preproc because the
+> per-map `*.inc` files are only prerequisites of the *native* `maps.o`, not the
+> wasm one. `map_data_rules.mk` now declares those prerequisites for
+> `$(WASM_OBJ_DIR)/maps.o` and `map_events.o`, so `make wasm` generates them
+> itself — making the reproduction steps below work from a fresh checkout.
+
+### M2 — WebSocket relay transport ✅ done
+- `web/relay.mjs`: a dependency-free RFC 6455 room relay (hand-rolled over
+  Node's `http` upgrade; the client uses Node's global `WebSocket`). It groups
+  peers into a room, assigns player ids by arrival order, and forwards each
+  `{type:'xfer'|'frameEnd'|...}` message to the other peers verbatim. Wired into
+  `web/server.mjs` so it shares the dev server's port.
+- `tools/wasm_relay_transport.mjs`: `RelayTransport` (the M1 `Transport`,
+  send/recv keyed by a monotonic transfer `seq`) plus role drivers. Player 0 is
+  the SIO master and owns the transfer clock (its `SioBus.driveFrame` reads the
+  master node's `SIO_START`/`Timer3`); the slave is reactive, doing one exchange
+  per master `xfer` and ending the frame on the master's `frameEnd` marker. The
+  `frameEnd` carries the master's `seq` so the slave asserts it replayed the
+  same number of transfers — a built-in lockstep-desync tripwire (seeds M3).
+- `tools/wasm_relay_client.mjs` (one peer) + `tools/wasm_link_relay.mjs`
+  (orchestrator: starts the relay, spawns a master + slave as separate
+  processes). The master is authoritative for timing — it drains to a clean
+  idle boundary, sends the block, then signals `finish`; the slave steps
+  reactively and watches for the block throughout.
+- **Verified:** `node tools/wasm_link_relay.mjs` — two OS processes, talking
+  only over WebSockets, reach `CONN_ESTABLISHED` (frame 7, same as the loopback)
+  and the master's 64-byte block arrives intact at the slave. Strict lockstep
+  (0 input-delay); the latency/input-delay buffer is left to M6 tuning.
 
 ### M3 — Desync detection
 Every K frames, exchange a truncated `stateHash()` (already implemented) over a
@@ -94,5 +134,6 @@ loaded save, complete a **link trade** and a **link battle** end to end.
 ```
 make wasm
 node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism
-node tools/wasm_link_loopback.mjs                             # link transport
+node tools/wasm_link_loopback.mjs                             # M1 in-process bus
+node tools/wasm_link_relay.mjs                                # M2 cross-process relay
 ```

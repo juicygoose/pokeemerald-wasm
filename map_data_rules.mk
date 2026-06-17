@@ -24,6 +24,14 @@ $(DATA_ASM_BUILDDIR)/maps.o: $(DATA_ASM_SUBDIR)/maps.s $(LAYOUTS_DIR)/layouts.in
 $(DATA_ASM_BUILDDIR)/map_events.o: $(DATA_ASM_SUBDIR)/map_events.s $(MAPS_DIR)/events.inc $(MAP_EVENTS)
 	$(PREPROC) $< charmap.txt | $(CPP) -I include - | $(PREPROC) -ie $< charmap.txt | $(AS) $(ASFLAGS) -o $@
 
+# The wasm build assembles the same map sources (via tools/wasm_asm_data.py), but
+# into $(WASM_OBJ_DIR). The order-only `| generated` prereq on the generic wasm
+# data rule only covers AUTO_GEN_TARGETS, not the per-map .inc files that maps.s /
+# map_events.s `.include`. Mirror the native prerequisites here so a clean
+# `make wasm` generates them first instead of failing in preproc.
+$(WASM_OBJ_DIR)/maps.o: $(LAYOUTS_DIR)/layouts.inc $(LAYOUTS_DIR)/layouts_table.inc $(MAPS_DIR)/headers.inc $(MAPS_DIR)/groups.inc $(MAPS_DIR)/connections.inc $(MAP_CONNECTIONS) $(MAP_HEADERS)
+$(WASM_OBJ_DIR)/map_events.o: $(MAPS_DIR)/events.inc $(MAP_EVENTS)
+
 
 $(MAPS_OUTDIR)/%/header.inc $(MAPS_OUTDIR)/%/events.inc $(MAPS_OUTDIR)/%/connections.inc: $(MAPS_DIR)/%/map.json
 	$(MAPJSON) map emerald $< $(LAYOUTS_DIR)/layouts.json $(@D)
