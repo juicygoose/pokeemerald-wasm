@@ -18,20 +18,32 @@ verifiable.
 
 ## Milestones
 
-### M1 — Extract the SIO bus into a reusable module
+### M1 — Extract the SIO bus into a reusable module ✅ done
 Pull the bus emulation out of `tools/wasm_link_loopback.mjs` into a shared
 module with a transport interface:
 
 ```
 class SioBus {
-  stageWord(playerId, word)      // from REG_SIOMLT_SEND
-  exchange() -> word[4]          // deliver RECV slots + call SerialCB on all
+  exchange() -> Promise<word[4]>  // stage local SIOMLT_SEND, swap, deliver RECV,
+                                  // call SerialCB on all local nodes
+  driveFrame() -> Promise<count>  // master-paced batch of exchanges per frame
 }
-interface Transport { send(word); recv() -> Promise<word[]>; }
+interface Transport { send(playerId, word); recv() -> Promise<word[4]>; }
 ```
 
-The loopback becomes a `LocalTransport` (array shuffle). **Verify:** loopback
-test still passes against the refactored module.
+Done in `tools/wasm_sio_bus.mjs`: `LinkNode` (per-console register/struct
+accessors), `SioBus` (transfer + per-frame cadence), `LocalTransport` (the
+loopback's synchronous word shuffle), plus `bootLinkInstance` / `stepFrame`
+shims. `tools/wasm_link_loopback.mjs` is now just the LocalTransport driver +
+verification. **Verified:** loopback still reaches `CONN_ESTABLISHED` (frame 7),
+completes the player-data exchange, and round-trips a 64-byte user block. The
+same `Transport` seam is what M2's relay and M4's browser session plug into.
+
+> Build note: a clean `make wasm` previously failed in preproc because the
+> per-map `*.inc` files are only prerequisites of the *native* `maps.o`, not the
+> wasm one. `map_data_rules.mk` now declares those prerequisites for
+> `$(WASM_OBJ_DIR)/maps.o` and `map_events.o`, so `make wasm` generates them
+> itself — making the reproduction steps below work from a fresh checkout.
 
 ### M2 — WebSocket relay transport
 - Tiny relay server (extend `web/server.mjs`, or a Cloudflare Worker +
