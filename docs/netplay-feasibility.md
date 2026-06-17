@@ -1,7 +1,13 @@
-# Netplay feasibility: determinism validation
+# Netplay feasibility for pokeemerald-wasm
 
-This documents a prototype that validates the core assumption behind adding
-GBA-link-cable multiplayer (trade / link battle / Union Room) to the wasm build.
+This documents two prototypes that together validate adding GBA-link-cable
+multiplayer (trade / link battle) to the wasm build:
+
+1. **Determinism** (`tools/wasm_determinism.mjs`) — the lockstep precondition.
+2. **Link transport** (`tools/wasm_link_loopback.mjs`) — the game's own link
+   layer running under wasm over a JS-emulated serial bus.
+
+Both pass. The sections below cover each in turn.
 
 ## Why determinism is the question
 
@@ -91,10 +97,57 @@ Remaining things to confirm as we build:
   (`SeedRng(gMain.vblankCounter2)` in `link.c`, contest passes `gRngValue` over
   the wire) — both peers must agree, which the lockstep exchange provides.
 
-## Next step (not in this prototype)
+## Link transport prototype (validated)
 
-Re-enable the link layer for wasm by exposing the per-frame command exchange to
-JS: each frame, read this peer's `gSendCmd`, send it over a WebSocket relay,
-collect the other peers' words, write them into `gRecvCmds` around
-`WasmRunFrame()`, and advance all peers in lockstep (with a small input-delay
-buffer). First milestone: 2-player link trade + link battle.
+`tools/wasm_link_loopback.mjs` proves the second half: the game's **unmodified**
+link layer (`src/link.c`) runs under wasm if we emulate the GBA serial
+multiplayer bus in JS. Two wasm instances are wired together in one process.
+
+How the bus is emulated (no game-code changes — `IsWirelessAdapterConnected`
+etc. stay stubbed; we only drive the cable path):
+
+- The GBA link is a synchronous multiplayer serial bus. Each console stages a
+  16-bit word in `REG_SIOMLT_SEND`; the master sets `SIO_START`; the serial
+  interrupt then fires on all consoles, each reading the 4-slot
+  `REG_SIOMLT_RECV` (slot = player id) and staging its next word.
+- The shim snapshots every instance's `SIOMLT_SEND`, broadcasts the same 4-word
+  vector into every instance's `RECV` slots, sets each instance's player-id /
+  terminal bits, and calls the exported `SerialCB()` on each. Timer3 (which
+  paces transfers within a frame on hardware) is emulated by calling the
+  exported `Timer3Intr()`. `LinkMain1/2` already run every `WasmRunFrame` via
+  `HandleLinkConnection`, so the state machine advances itself.
+- Two non-game-logic accommodations, both legitimate for a zero-latency loopback:
+  we drive `gShouldAdvanceLinkState` / `CheckShouldAdvanceLinkState` (normally
+  called by cable-club UI code that isn't running), and we clear the timing-based
+  `gLink.lag` flag (a real cable can't lag when both ends step in lockstep).
+
+### Result
+
+```
+node tools/wasm_link_loopback.mjs
+  → handshake completes; master/slave elected (isMaster 8/0), ids 0/1
+  → ✅ CONN_ESTABLISHED at frame 7, player count 2/2
+  → ✅ player-data block exchange verified (gReceivedRemoteLinkPlayers)
+       — a real LinkPlayer block round-trip, magic "GameFreak inc." + checksum
+  → ✅ user 64-byte block round-trip verified
+```
+
+(One boot detail: empty flash leaves the player name un-terminated, so
+`InitLocalLinkPlayer`'s `StringCopy` overruns; the harness writes an
+`EOS`-terminated name. A real save makes this moot.)
+
+This is exactly the machinery trades and link battles ride on (`SendBlock` /
+`gBlockRecvBuffer` / `gLinkPlayers`), so the transport is proven end to end.
+
+## Next step: real transport + game UI
+
+1. **Swap the loopback for a relay.** Replace the in-process bus with a
+   WebSocket relay: each frame send this peer's staged `SIOMLT_SEND` word, wait
+   for the other peers' words, then run the `SerialCB` exchange. Advance frames
+   in lockstep with a small input-delay buffer to hide latency.
+2. **Wire it into `web/app.js`.** Add the SIO shim around `WasmRunFrame()` and a
+   "connect" UI, reusing `web/server.mjs` (or Cloudflare Workers per
+   `wrangler.toml`) for matchmaking/relay.
+3. **Drive it from the game UI** (Cable Club) instead of the programmatic
+   `OpenLink` bring-up, and validate a full **2-player trade and link battle**
+   from a loaded save — adding that scenario to the determinism script.
