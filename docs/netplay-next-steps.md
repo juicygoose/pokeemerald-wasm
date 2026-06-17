@@ -6,6 +6,21 @@ link layer reaches `CONN_ESTABLISHED` and round-trips blocks over a JS-emulated
 serial bus. What remains is engineering, staged so each step is independently
 verifiable.
 
+## Status
+
+| Milestone | State |
+|---|---|
+| M1 — Reusable SIO bus module | ✅ done |
+| M2 — WebSocket relay transport | ✅ done |
+| M3 — Desync detection | ⬜ next (seeded by M2's per-frame seq tripwire) |
+| M4 — Browser integration | ⬜ |
+| M5 — Drive from the in-game Cable Club | ⬜ |
+| M6 — Hardening | ⬜ |
+
+The link cable now works in-process (M1) and across two OS processes over real
+WebSockets (M2), both with no game-code changes. Run them with the commands in
+[Reproduce the prototypes](#reproduce-the-prototypes).
+
 ## Guiding constraints
 
 - **No game-logic changes.** Keep all multiplayer in JS + WASM-only shims, as
