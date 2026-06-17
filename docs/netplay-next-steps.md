@@ -15,12 +15,16 @@ verifiable.
 | M3 — Desync detection | ✅ done |
 | M4 — Browser integration | ✅ done |
 | M5 — Drive from the in-game Cable Club | 🔶 spike done — thesis proven; full trade/battle is a browser task |
-| M6 — Hardening | ⬜ |
+| M6 — Hardening | ✅ done (relay lifecycle/abuse limits, latency tolerance, reconnect, overworld determinism) |
 
 The link cable now works in-process (M1), across two OS processes over real
 WebSockets (M2), and **in the browser** (M4) — all with no game-code changes —
-with a lockstep desync detector (M3) catching any divergence between peers. Run
-them with the commands in [Reproduce the prototypes](#reproduce-the-prototypes).
+with a lockstep desync detector (M3) catching any divergence between peers, and
+a hardened relay (M6: rate/size limits, room TTLs, reconnect-with-resume,
+latency tolerance). The M5 spike proved the in-game Cable Club drives the link
+itself; finishing a full trade/battle is the remaining browser work. Run
+everything with the commands in
+[Reproduce the prototypes](#reproduce-the-prototypes).
 
 ## Guiding constraints
 
@@ -185,13 +189,40 @@ scripted blindly (confirmed: naive input never even leaves the truck). So:
   (`CB2_StartCreateTradeMenu`) / battle callbacks. **Verify:** two players
   complete a link trade and a link battle end to end.
 
-### M6 — Hardening
-- Latency tuning (input-delay vs. responsiveness), reconnect on transient
-  socket drops, room lifecycle/cleanup.
-- Add a save-loaded trade/battle scenario to `tools/wasm_determinism.mjs` so
-  the cross-machine determinism guarantee is continuously checked.
-- Optional: confirm state determinism on a genuinely different machine/browser
-  (logic uses only integer `Div` + IEEE `Sqrt`, so it should hold).
+### M6 — Hardening ✅ done
+- **Relay lifecycle + abuse limits** (`web/relay.mjs`): per-connection message
+  rate limit (token bucket), max frame size, room idle-TTL reap, and unfilled-
+  room join-timeout reap. All overridable; defaults are generous so normal play
+  is unaffected. **Verify:** `node tools/wasm_relay_hardening.mjs` trips each
+  guard (oversized frame dropped, rate exceeded dropped, join-timeout and idle
+  rooms reaped).
+- **Latency tolerance** (`tools/wasm_relay_latency.mjs`): the relay can inject
+  per-message forwarding latency, and the M2 block round-trip + M3 desync run
+  through it unchanged. The key invariant: **establishment still happens at game
+  frame 7 regardless of latency** — lockstep is paced in frames, not
+  milliseconds, so latency only costs wall-clock time. On *input-delay* proper:
+  the per-transfer serial model can't pre-commit words (each staged word depends
+  on the previous transfer's RECV), so classic N-frame input-delay doesn't
+  apply; what makes it tolerable is that the game is turn-based and the bus
+  posts both peers' words for a transfer simultaneously (cost ≈ one-way delay,
+  not RTT). A jitter buffer is unnecessary because delivery is already
+  seq-keyed and order-preserving.
+- **Reconnect across transient drops** (`tools/wasm_relay_reconnect.mjs`): the
+  relay holds a dropped peer's slot for a grace window, buffers everything bound
+  for it, and replays it on resume (`{type:'join', resume:<id>}`); the transport
+  auto-reconnects, and both sides re-post any in-flight serial word (de-duped by
+  the `seq` guard) so no word is lost or duplicated. Proven correct with the M3
+  desync detector as the oracle: a forced mid-session drop completes **0,0 with
+  the detector quiet** — the wire transcript is bit-identical across the break.
+- **Continuous determinism on a richer scenario** (`tools/wasm_determinism.mjs
+  --scenario overworld`): uses the `WasmStartNewGame` shim to fingerprint a
+  running overworld (map load + field tasks + RNG), a far stronger
+  cross-machine determinism check than the title screen. Bit-identical across
+  instances; `--diverge-at` still trips. A save-loaded trade/battle scenario is
+  deferred with the rest of M5 to the browser (no headless overworld save yet).
+- Optional cross-machine/browser determinism check: still recommended as a
+  one-off (logic is integer `Div` + IEEE `Sqrt`), now easy via
+  `--emit golden.json` / `--compare golden.json --scenario overworld`.
 
 ## Explicitly out of scope (for now)
 
@@ -205,20 +236,24 @@ scripted blindly (confirmed: naive input never even leaves the truck). So:
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Cross-machine state divergence | Low | Logic is integer-only; add M6 cross-machine check |
-| Latency makes lockstep feel sluggish | Medium | Input-delay buffer; turn-based game is forgiving |
+| Cross-machine state divergence | Low | Logic is integer-only; M6 added a richer overworld determinism scenario (`--scenario overworld`) + golden emit/compare for a one-off cross-machine check |
+| Latency makes lockstep feel sluggish | ~~Medium~~ Mitigated | M6 latency test confirms establishment stays at frame 7 under injected latency; lockstep is frame-paced, cost ≈ one-way delay, turn-based game is forgiving |
 | Cable Club flow needs more shim surface than `OpenLink` | ~~Medium~~ Retired | M5 spike proved the game drives `OpenLink` itself under the normal loop; the only "extra surface" is running the full game loop (no new transport code) |
-| Relay abuse / room squatting | Low | Room TTLs, max peers, rate limits in M6 |
+| Relay abuse / room squatting | ~~Low~~ Mitigated | M6 added per-connection rate limit, max frame size, room idle-TTL + join-timeout reap, max peers (see `wasm_relay_hardening.mjs`) |
 
 ## Reproduce the prototypes
 
 ```
 make wasm
-node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism
+node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism (title)
+node tools/wasm_determinism.mjs --scenario overworld --frames 600  # M6 overworld determinism
 node tools/wasm_link_loopback.mjs                             # M1 in-process bus
 node tools/wasm_link_relay.mjs                                # M2 cross-process relay
 node tools/wasm_link_desync.mjs                               # M3 desync detection
 node tools/wasm_netplay_check.mjs                             # M4 browser driver (headless)
 node web/server.mjs   # then open http://localhost:8000 in two tabs, same room  # M4 in-browser
 node tools/wasm_cable_club_spike.mjs                          # M5 spike (game-driven link)
+node tools/wasm_relay_hardening.mjs                           # M6 relay lifecycle/abuse limits
+node tools/wasm_relay_reconnect.mjs                           # M6 reconnect across a transient drop
+node tools/wasm_relay_latency.mjs --latency 12                # M6 latency tolerance (slow)
 ```

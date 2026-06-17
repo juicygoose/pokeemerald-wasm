@@ -44,6 +44,7 @@ function parseArgs() {
   const o = {
     url: '', room: 'r', wasm: 'build/wasm/pokeemerald.wasm',
     mode: 'block', frames: DESYNC_FRAMES, hashEvery: HASH_EVERY, corruptAt: -1,
+    reconnect: false, dropAt: -1,
   };
   for (let i = 0; i < a.length; i++) {
     if (a[i] === '--url') o.url = a[++i];
@@ -55,6 +56,8 @@ function parseArgs() {
     // Negative control (honored only by the slave so exactly one peer diverges):
     // flip a bit in this peer's transcript hash at the given checkpoint frame.
     else if (a[i] === '--corrupt-at') o.corruptAt = Number(a[++i]);
+    else if (a[i] === '--reconnect') o.reconnect = true;  // auto-resume across socket drops
+    else if (a[i] === '--drop-at') o.dropAt = Number(a[++i]); // simulate a transient drop at this checkpoint
     else { console.error(`unknown arg: ${a[i]}`); process.exit(2); }
   }
   return o;
@@ -69,7 +72,8 @@ async function main() {
   const { ws, playerId, playerCount } = await connectPeer(opts.url, opts.room);
   // Construct the transport synchronously (attaches the message handler before
   // any await yields to the event loop), then barrier so neither side races.
-  const transport = new RelayTransport(ws, { localId: playerId, peerId: 1 - playerId });
+  const reconnect = opts.reconnect ? { url: opts.url, room: opts.room, max: 2 } : null;
+  const transport = new RelayTransport(ws, { localId: playerId, peerId: 1 - playerId, reconnect });
 
   // Link role is derived from the assigned id: player 0 is the SIO master.
   const role = playerId === 0 ? 'master' : 'slave';
@@ -111,6 +115,7 @@ async function main() {
       if (!transport.desync) throw e;
       res = reportDesync(transport, log, 0);
     }
+    transport.closedByUs = true; // intentional shutdown: don't auto-reconnect now
     code = res === 'desync' ? 3 : 0; // 3 = desync alarm fired (distinct from crash)
   } else {
     const ok = role === 'master'
@@ -156,9 +161,17 @@ async function runMasterDesync(bus, transport, log, establishedAt, opts) {
 async function runSlaveDesync(bus, transport, log, opts) {
   let cp = 0;
   let checkpoints = 0;
+  let dropped = false;
   for (;;) {
     const { finished } = await slaveStepFrame(bus, transport, {});
     if (finished) break;
+    // Simulate a transient socket drop; the transport must resume and the
+    // desync detector must STILL stay quiet (proving no word was lost/duped).
+    if (cp === opts.dropAt && !dropped) {
+      dropped = true;
+      log(`simulating transient socket drop at checkpoint ${cp}`);
+      try { transport.ws.close(); } catch {}
+    }
     if (cp % opts.hashEvery === 0) {
       let h = bus.transcript >>> 0;
       if (cp === opts.corruptAt) { h = (h ^ 0x1) >>> 0; log(`(injecting transcript fault at checkpoint ${cp})`); }

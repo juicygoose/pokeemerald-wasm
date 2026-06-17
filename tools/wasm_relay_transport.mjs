@@ -37,12 +37,16 @@ export function connectPeer(url, room, { max = 2 } = {}) {
 }
 
 export class RelayTransport {
-  constructor(ws, { localId, peerId }) {
+  // `reconnect` (optional) enables auto-resume across a transient socket drop:
+  //   { url, room, max, maxAttempts?, backoffMs? }
+  // The relay must be configured with reconnectGraceMs > 0 for resume to work.
+  constructor(ws, { localId, peerId, reconnect = null }) {
     this.ws = ws;
     this.localId = localId;
     this.peerId = peerId;
     this.seq = 0;             // monotonic transfer counter (shared numbering)
     this.localWord = ABSENT;
+    this.inFlight = false;    // true between send() and its recv() completing
     this.peerWords = new Map(); // seq -> peer's word, filled by incoming 'xfer'
     this.pendingWord = new Map(); // seq -> resolver awaiting peerWords[seq]
     this.events = [];         // ordered {kind:'xfer',seq} / {kind:'frameEnd'} (slave driver)
@@ -59,17 +63,72 @@ export class RelayTransport {
     this.desync = null;            // {key, local, peer} on first mismatch
     this._finishAcked = false;
     this._finishAckWaiter = null;
-    ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
-    ws.onclose = () => this._fail('relay closed');
-    ws.onerror = () => this._fail('relay error');
+    // Reconnect state.
+    this._reconnectCfg = reconnect;
+    this.reconnecting = false;
+    this.closedByUs = false;
+    this._bindSocket(ws);
   }
+
+  // (Re)bind handlers to a socket; the `e.target !== this.ws` guard ignores late
+  // events from a socket we've already replaced during a reconnect.
+  _bindSocket(ws) {
+    ws.onmessage = (e) => { if (!e.target || e.target === this.ws) this._onMessage(JSON.parse(e.data)); };
+    ws.onclose = (e) => { if (!e || !e.target || e.target === this.ws) this._socketDown(); };
+    ws.onerror = (e) => { if (!e || !e.target || e.target === this.ws) this._socketDown(); };
+  }
+
+  // A socket dropped. Resume if reconnect is configured and we didn't close on
+  // purpose; otherwise fail the transport as before.
+  _socketDown() {
+    if (this.disconnected || this.closedByUs) return;
+    if (this._reconnectCfg && !this.reconnecting) this._reconnect();
+    else this._fail('relay closed');
+  }
+
+  async _reconnect() {
+    this.reconnecting = true;
+    const { url, room, max = 2, maxAttempts = 8, backoffMs = 100 } = this._reconnectCfg;
+    for (let attempt = 1; attempt <= maxAttempts && !this.closedByUs; attempt++) {
+      try {
+        const ws = await new Promise((res, rej) => {
+          const s = new WebSocket(url);
+          s.onopen = () => res(s);
+          s.onerror = () => rej(new Error('reconnect open failed'));
+        });
+        this.ws = ws;            // adopt before binding so the target guard passes
+        this._bindSocket(ws);
+        // Rejoin our slot; the relay replays everything buffered while we were
+        // gone. Then re-post the in-flight word in case our last send was lost
+        // on the way down (duplicates are ignored via the seq < this.seq guard).
+        ws.send(JSON.stringify({ type: 'join', room, max, resume: this.localId }));
+        if (this.inFlight) ws.send(JSON.stringify({ type: 'xfer', seq: this.seq, word: this.localWord }));
+        this.reconnecting = false;
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, backoffMs * attempt));
+      }
+    }
+    this.reconnecting = false;
+    if (!this.closedByUs) this._fail('reconnect failed');
+  }
+
+  // Intentional shutdown: don't try to reconnect when we close on purpose.
+  close() { this.closedByUs = true; try { this.ws.send(JSON.stringify({ type: 'bye' })); this.ws.close(); } catch {} }
 
   _onMessage(m) {
     if (m.type === 'xfer') {
+      if (m.seq < this.seq) return; // duplicate (e.g. a reconnect re-post) — already consumed
       this.peerWords.set(m.seq, m.word);
       const r = this.pendingWord.get(m.seq);
       if (r) { this.pendingWord.delete(m.seq); r(m.word); }
       this._pushEvent({ kind: 'xfer', seq: m.seq });
+    } else if (m.type === 'resumed') {
+      // Slot reclaimed after a drop; buffered messages follow. Nothing to do.
+    } else if (m.type === 'peerResumed') {
+      // Our peer reconnected; if we have a transfer in flight, our last send may
+      // have been lost while it was down — re-post it (the seq guard dedupes).
+      if (this.inFlight) this._post({ type: 'xfer', seq: this.seq, word: this.localWord });
     } else if (m.type === 'frameEnd') {
       this._pushEvent({ kind: 'frameEnd', frame: m.frame, seq: m.seq });
     } else if (m.type === 'finish') {
@@ -155,6 +214,7 @@ export class RelayTransport {
   // --- Transport interface (called by SioBus.exchange) ----------------------
   send(playerId, word) {
     this.localWord = word & 0xffff;
+    this.inFlight = true; // outstanding until recv() for this seq completes
     this._post({ type: 'xfer', seq: this.seq, word: this.localWord });
   }
 
@@ -164,6 +224,7 @@ export class RelayTransport {
     recv[this.localId] = this.localWord;
     recv[this.peerId] = peerWord;
     this.seq++;
+    this.inFlight = false;
     return recv;
   }
 
