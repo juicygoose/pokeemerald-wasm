@@ -32,13 +32,32 @@ const DRAIN_A = 80;        // let player-data exchange + in-flight blocks settle
 const DRAIN_B = 20;        // post-reset settle
 const SEND_WINDOW = 250;   // frames to carry the user block across
 
+// M3 desync-mode defaults: run the established link in strict lockstep and sample
+// the transcript hash every HASH_EVERY frames over DESYNC_FRAMES total.
+const DESYNC_FRAMES = 300;
+const HASH_EVERY = 16;
+
+const hex = (n) => (n >>> 0).toString(16).padStart(8, '0');
+
 function parseArgs() {
   const a = process.argv.slice(2);
-  const o = { url: '', room: 'r', wasm: 'build/wasm/pokeemerald.wasm' };
+  const o = {
+    url: '', room: 'r', wasm: 'build/wasm/pokeemerald.wasm',
+    mode: 'block', frames: DESYNC_FRAMES, hashEvery: HASH_EVERY, corruptAt: -1,
+    reconnect: false, dropAt: -1,
+  };
   for (let i = 0; i < a.length; i++) {
     if (a[i] === '--url') o.url = a[++i];
     else if (a[i] === '--room') o.room = a[++i];
     else if (a[i] === '--wasm') o.wasm = a[++i];
+    else if (a[i] === '--mode') o.mode = a[++i];          // 'block' (default) | 'desync'
+    else if (a[i] === '--frames') o.frames = Number(a[++i]);
+    else if (a[i] === '--hash-every') o.hashEvery = Number(a[++i]);
+    // Negative control (honored only by the slave so exactly one peer diverges):
+    // flip a bit in this peer's transcript hash at the given checkpoint frame.
+    else if (a[i] === '--corrupt-at') o.corruptAt = Number(a[++i]);
+    else if (a[i] === '--reconnect') o.reconnect = true;  // auto-resume across socket drops
+    else if (a[i] === '--drop-at') o.dropAt = Number(a[++i]); // simulate a transient drop at this checkpoint
     else { console.error(`unknown arg: ${a[i]}`); process.exit(2); }
   }
   return o;
@@ -53,7 +72,8 @@ async function main() {
   const { ws, playerId, playerCount } = await connectPeer(opts.url, opts.room);
   // Construct the transport synchronously (attaches the message handler before
   // any await yields to the event loop), then barrier so neither side races.
-  const transport = new RelayTransport(ws, { localId: playerId, peerId: 1 - playerId });
+  const reconnect = opts.reconnect ? { url: opts.url, room: opts.room, max: 2 } : null;
+  const transport = new RelayTransport(ws, { localId: playerId, peerId: 1 - playerId, reconnect });
 
   // Link role is derived from the assigned id: player 0 is the SIO master.
   const role = playerId === 0 ? 'master' : 'slave';
@@ -82,11 +102,87 @@ async function main() {
   if (establishedAt === -1) { log('❌ never reached CONN_ESTABLISHED'); cleanup(ws); process.exit(1); }
   log(`✅ CONN_ESTABLISHED at frame ${establishedAt} (id ${rt.exports.GetMultiplayerId()}, ${rt.exports.GetLinkPlayerCount()} players)`);
 
-  const ok = role === 'master'
-    ? await runMaster(bus, transport, rt, log, establishedAt)
-    : await runSlave(bus, transport, rt, log);
+  let code;
+  if (opts.mode === 'desync') {
+    let res;
+    try {
+      res = role === 'master'
+        ? await runMasterDesync(bus, transport, log, establishedAt, opts)
+        : await runSlaveDesync(bus, transport, log, opts);
+    } catch (e) {
+      // A peer that detects desync may drop the socket while we're mid-transfer;
+      // if we already know it desynced, that's the alarm, not a crash.
+      if (!transport.desync) throw e;
+      res = reportDesync(transport, log, 0);
+    }
+    transport.closedByUs = true; // intentional shutdown: don't auto-reconnect now
+    code = res === 'desync' ? 3 : 0; // 3 = desync alarm fired (distinct from crash)
+  } else {
+    const ok = role === 'master'
+      ? await runMaster(bus, transport, rt, log, establishedAt)
+      : await runSlave(bus, transport, rt, log);
+    code = ok ? 0 : 1;
+  }
   cleanup(ws);
-  process.exit(ok ? 0 : 1);
+  process.exit(code);
+}
+
+// --- M3: desync detection (returns 'ok' | 'desync') --------------------------
+// Both peers drive the established link in strict lockstep and sample the shared
+// transcript hash every `hashEvery` frames over the same checkpoint numbering.
+// In sync the two hashes match every checkpoint; a single perturbation (the
+// --corrupt-at negative control) trips the alarm.
+function reportDesync(transport, log, checkpoints) {
+  if (transport.desync) {
+    const { key, local, peer } = transport.desync;
+    log(`❌ DESYNC at checkpoint ${key}: local ${hex(local)} != peer ${hex(peer)}`);
+    return 'desync';
+  }
+  log(`✅ in sync across ${checkpoints} transcript checkpoints (${HASH_EVERY}-frame cadence)`);
+  return 'ok';
+}
+
+// MASTER drives the clock and never corrupts; it owns the end-of-run handshake.
+async function runMasterDesync(bus, transport, log, establishedAt, opts) {
+  let frame = establishedAt + 1;
+  let checkpoints = 0;
+  for (let cp = 0; cp < opts.frames; cp++) {
+    await masterStepFrame(bus, transport, { frame: frame++ });
+    if (cp % opts.hashEvery === 0) { transport.checkpointHash(cp, bus.transcript); checkpoints++; }
+    if (transport.desync) break;
+  }
+  transport.finish();
+  // Clean run: wait for the slave's ack so every checkpoint is provably compared.
+  if (!transport.desync) await transport.awaitFinishAck();
+  return reportDesync(transport, log, checkpoints);
+}
+
+// SLAVE is reactive and is the peer that injects the negative-control fault.
+async function runSlaveDesync(bus, transport, log, opts) {
+  let cp = 0;
+  let checkpoints = 0;
+  let dropped = false;
+  for (;;) {
+    const { finished } = await slaveStepFrame(bus, transport, {});
+    if (finished) break;
+    // Simulate a transient socket drop; the transport must resume and the
+    // desync detector must STILL stay quiet (proving no word was lost/duped).
+    if (cp === opts.dropAt && !dropped) {
+      dropped = true;
+      log(`simulating transient socket drop at checkpoint ${cp}`);
+      try { transport.ws.close(); } catch {}
+    }
+    if (cp % opts.hashEvery === 0) {
+      let h = bus.transcript >>> 0;
+      if (cp === opts.corruptAt) { h = (h ^ 0x1) >>> 0; log(`(injecting transcript fault at checkpoint ${cp})`); }
+      transport.checkpointHash(cp, h);
+      checkpoints++;
+    }
+    cp++;
+    if (transport.desync) break;
+  }
+  transport.finishAck();
+  return reportDesync(transport, log, checkpoints);
 }
 
 // MASTER drives all timing: drain until the link task is idle (so no block is in

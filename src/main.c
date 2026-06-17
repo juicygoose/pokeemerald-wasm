@@ -186,6 +186,20 @@ void WasmRunFrame(void)
 #endif
 }
 
+#if WASM
+// Headless bring-up shim (NOT game logic): jump straight into a fresh game's
+// overworld, skipping the title/intro/Birch menus that otherwise require
+// interactive menu navigation (gender, naming screen) the headless harness
+// can't drive. CB2_NewGame runs NewGameInitData + the map-load loop itself over
+// the following frames. Used by the netplay Cable Club harness
+// (docs/netplay-next-steps.md, M5). Exposed only because callers in JS cannot
+// synthesize the C function pointer that SetMainCallback2(CB2_NewGame) needs.
+void WasmStartNewGame(void)
+{
+    SetMainCallback2(CB2_NewGame);
+}
+#endif
+
 static void UpdateLinkAndCallCallbacks(void)
 {
     if (!HandleLinkConnection())

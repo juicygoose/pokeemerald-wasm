@@ -49,6 +49,21 @@ export const playerCountOf = (s) => (s >>> 2) & 7;
 export const LINK_STATE_START1 = 1;
 export const ABSENT = 0xffff; // RECV slot value for an unconnected player
 
+// FNV-1a fold of a transfer's 4-slot RECV vector into a rolling hash. The RECV
+// vector is the SHARED truth of a serial transfer (slot i = player i's word,
+// ABSENT for absent slots) and is bit-identical on every peer — so a rolling
+// hash of every applied RECV word is identical across peers exactly while they
+// stay in lockstep, and the first transfer where the wire disagrees flips it.
+export const FNV_OFFSET = 2166136261;
+export function foldRecv(hash, recv) {
+  for (let i = 0; i < 4; i++) {
+    const w = recv[i] & 0xffff;
+    hash = Math.imul(hash ^ (w & 0xff), 16777619);
+    hash = Math.imul(hash ^ (w >>> 8), 16777619);
+  }
+  return hash >>> 0;
+}
+
 // A single console on the bus: thin accessors over one wasm runtime's memory.
 export class LinkNode {
   constructor(rt, index) {
@@ -119,12 +134,16 @@ export class SioBus {
     this.nodes = nodes;
     this.transport = transport;
     this.master = nodes[0];
+    // Rolling FNV-1a over every applied RECV vector: the lockstep checksum M3's
+    // desync detector samples. Identical across peers iff the wire agrees.
+    this.transcript = FNV_OFFSET;
   }
 
   // One serial multiplayer transfer across all peers.
   async exchange() {
     for (const node of this.nodes) this.transport.send(node.index, node.stagedSend());
     const recv = await this.transport.recv();
+    this.transcript = foldRecv(this.transcript, recv);
     for (const node of this.nodes) {
       node.deliverRecv(recv);
       node.maintainTerminals(); // sets id + clears error before SerialCB reads them

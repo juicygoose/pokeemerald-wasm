@@ -12,14 +12,25 @@ verifiable.
 |---|---|
 | M1 — Reusable SIO bus module | ✅ done |
 | M2 — WebSocket relay transport | ✅ done |
-| M3 — Desync detection | ⬜ next (seeded by M2's per-frame seq tripwire) |
-| M4 — Browser integration | ⬜ |
-| M5 — Drive from the in-game Cable Club | ⬜ |
-| M6 — Hardening | ⬜ |
+| M3 — Desync detection | ✅ done |
+| M4 — Browser integration | ✅ done |
+| M5 — Drive from the in-game Cable Club | 🔶 spike done — thesis proven; full trade/battle is a browser task |
+| M6 — Hardening | ✅ done (relay lifecycle/abuse limits, latency tolerance, reconnect, overworld determinism) |
 
-The link cable now works in-process (M1) and across two OS processes over real
-WebSockets (M2), both with no game-code changes. Run them with the commands in
+The link cable now works in-process (M1), across two OS processes over real
+WebSockets (M2), and **in the browser** (M4) — all with no game-code changes —
+with a lockstep desync detector (M3) catching any divergence between peers, and
+a hardened relay (M6: rate/size limits, room TTLs, reconnect-with-resume,
+latency tolerance). The M5 spike proved the in-game Cable Club drives the link
+itself; finishing a full trade/battle is the remaining browser work. Run
+everything with the commands in
 [Reproduce the prototypes](#reproduce-the-prototypes).
+
+> **What's left** is tracked in
+> [`netplay-remaining-work.md`](./netplay-remaining-work.md): finishing M5's full
+> link trade + battle in the browser, plus optional follow-ups (headless trade
+> determinism, browser reconnect UI, 3–4-player link, relay productionization).
+> The transport stack itself is complete.
 
 ## Guiding constraints
 
@@ -83,34 +94,141 @@ same `Transport` seam is what M2's relay and M4's browser session plug into.
   and the master's 64-byte block arrives intact at the slave. Strict lockstep
   (0 input-delay); the latency/input-delay buffer is left to M6 tuning.
 
-### M3 — Desync detection
-Every K frames, exchange a truncated `stateHash()` (already implemented) over a
-side channel and compare. On mismatch, surface a clear "desync" error rather
-than silently diverging. **Verify:** intentionally perturb one client's input
-and confirm the desync alarm fires (the determinism harness's `--diverge-at`
-already demonstrates the detector logic).
+### M3 — Desync detection ✅ done
+Every K frames each peer samples a checksum over a side channel and compares; on
+mismatch it raises a clear "desync" error instead of silently diverging.
 
-### M4 — Browser integration (`web/app.js`)
-- Add the SIO shim around `WasmRunFrame()`: read this peer's
-  `REG_SIOMLT_SEND`, push to the transport, await peers, deliver `RECV`, call
-  `SerialCB`. Gate it on an "online" mode so single-player is unaffected.
-- Minimal connect UI (host/join a room code).
-- **Verify:** two browser tabs reach `CONN_ESTABLISHED` and exchange a block,
-  mirroring the loopback in-browser.
+What's checksummed is the **serial transcript**, not the full `stateHash()`. The
+two peers are different players (different names, link ids, `isMaster`), so their
+full game states legitimately differ — a full-state compare would always
+"mismatch". The shared truth is instead the wire: every transfer's 4-slot RECV
+vector (slot i = player i's word) is bit-identical on every peer, so a rolling
+FNV-1a of every applied RECV word (`SioBus.transcript`,
+[`tools/wasm_sio_bus.mjs`](../tools/wasm_sio_bus.mjs)) is identical across peers
+exactly while they stay in lockstep. This catches wrong word *values*, strictly
+stronger than M2's per-frame transfer-*count* tripwire.
 
-### M5 — Drive from the in-game Cable Club
-Replace the programmatic `OpenLink` bring-up with the real flow: walk to a
-Cable Club table, talk to the attendant, and let the game call `OpenLink`
-itself. The shim just provides the bus. **Verify:** two players, each from a
-loaded save, complete a **link trade** and a **link battle** end to end.
+- `RelayTransport.checkpointHash(key, hash)` posts a `{type:'hash'}` over the
+  relay (forwarded verbatim — no relay change) and compares against the peer's
+  for the same `key`; the first mismatch records `transport.desync` and the
+  drivers surface it. A `finishAck` handshake lets a clean run prove every
+  checkpoint was compared (per-peer socket ordering guarantees all hashes
+  arrived before the ack).
+- `tools/wasm_relay_client.mjs --mode desync` drives the established link in
+  strict lockstep and samples every 16 frames; `--corrupt-at F` is the negative
+  control (the slave flips one bit of its transcript hash at checkpoint `F`).
+- **Verified:** `node tools/wasm_link_desync.mjs` runs two scenarios — a clean
+  run stays in sync across all 19 checkpoints (detector quiet), and the negative
+  control fires the desync alarm on **both** peers at checkpoint 160. The
+  determinism harness's `--diverge-at` independently demonstrates the same
+  detector logic against real state divergence in-process.
 
-### M6 — Hardening
-- Latency tuning (input-delay vs. responsiveness), reconnect on transient
-  socket drops, room lifecycle/cleanup.
-- Add a save-loaded trade/battle scenario to `tools/wasm_determinism.mjs` so
-  the cross-machine determinism guarantee is continuously checked.
-- Optional: confirm state determinism on a genuinely different machine/browser
-  (logic uses only integer `Div` + IEEE `Sqrt`, so it should hold).
+### M4 — Browser integration ✅ done
+The browser now runs the *same* SIO stack the headless tooling does — no second
+implementation. The key realization: `tools/wasm_sio_bus.mjs` and
+`tools/wasm_relay_transport.mjs` use only browser-safe globals (`WebSocket`,
+`JSON`, `Math`), and `web/app.js` is already an ES module, so the browser imports
+them directly (the dev server serves the repo root; `.mjs` now maps to a JS MIME
+type in `web/server.mjs`).
+
+- `web/netplay.mjs`: an environment-agnostic online-session driver. It takes an
+  injected `rt` (the live wasm instance), a `present()` callback (render + yield
+  to the browser between steps), and a room code, then runs the relay client's
+  exact flow — connect, bring the link up, reach `CONN_ESTABLISHED`, round-trip a
+  64-byte block — sampling `bus.transcript` every 16 frames for **M3 desync
+  detection in the tab**.
+- `web/app.js`: an `rt` adapter over the running instance (the same shape
+  `wasm_gba_runtime.mjs` returns), plus an "online" mode that suspends the
+  single-player tick (by bumping `bootId`) and lets the session drive rendering.
+  Single-player is untouched until you connect; disconnecting reboots it.
+- `web/index.html` / `style.css`: a minimal connect panel (room code + a
+  Connect/Disconnect button) and a dedicated status line.
+- **Verify:** open two tabs, type the same room code in both, click Connect —
+  both reach `CONN_ESTABLISHED` and the block round-trips, mirroring the
+  loopback in-browser. Two real tabs can't run in CI, so the same browser driver
+  is exercised headlessly by `tools/wasm_netplay_check.mjs` (two peers through
+  `web/netplay.mjs` over the in-process relay): establishment at frame 7, block
+  intact, 17 desync checkpoints in sync.
+
+### M5 — Drive from the in-game Cable Club 🔶 spike done
+Goal: replace the programmatic `OpenLink` bring-up with the real flow — walk to
+a Cable Club, talk to the attendant, let the game call `OpenLink` itself; the
+shim just provides the bus.
+
+**Spike (`tools/wasm_cable_club_spike.mjs`) — what it proved:**
+1. **The transport needs no changes.** Everything M1–M4 built (SioBus, relay,
+   desync) is agnostic to who opens the link.
+2. **The game drives the link itself.** Calling `TryTradeLinkup` (the very
+   `special` the attendant script invokes — see `data/scripts/cable_club.inc` →
+   `src/cable_club.c:610`) under the real overworld loop (`CB2_Overworld` →
+   `RunTasks` → `Task_LinkupStart`) makes the game set `LINKTYPE_TRADE_SETUP`
+   and call `OpenLinkTimed` on its own (verified: `gLinkCallback` is set by game
+   code, not JS). This is exactly M5's thesis.
+3. **The real shim surface beyond `OpenLink` is *running the full game loop*,
+   not new transport code.** M1–M4 silenced the main callback; M5 must let
+   `CB2_Overworld` and the whole field/menu stack run. The cable-club flow is
+   input-driven (A-button confirms, `GetFieldMessageBoxMode`, windows) and uses
+   `OpenLinkTimed` + `GetLinkPlayerDataExchangeStatusTimed` + a trainer-card
+   block exchange + `LinkCB_SendHeldKeys` steady state — all carried by the
+   existing bus.
+
+**New headless infra:** `WasmStartNewGame` (a one-line WASM-only shim in
+`src/main.c`, gated `#if WASM`, like `WasmRunFrame`) jumps straight into a fresh
+game's overworld, skipping the title/Birch menus that need interactive
+navigation. It exists only because JS can't synthesize the C function pointer
+`SetMainCallback2(CB2_NewGame)` needs.
+
+**The boundary / why the rest is a browser task:** triggering linkup needs a
+*clean Cable Club field state*. Forced mid-intro (the new-game truck), the
+game's `Task_LinkupStart` opens the link and then faults in `AddWindow` — the
+field isn't ready to open the cable-club window. Reaching a real Cable Club
+headlessly means playing the entire intro (exit truck → Littleroot → … → a
+Pokémon Center Cable Club in another town, with a party), which can't be
+scripted blindly (confirmed: naive input never even leaves the truck). So:
+
+- **Full link trade + battle is driven in the browser** using M4's online
+  session plus real navigation (two players, each from a loaded save, walk to
+  the attendant). The headless harness stays for transport/link-layer checks.
+- Remaining M5 work (browser): swap the prototype's programmatic bring-up for
+  the attendant flow, route the per-frame `REG_SIOMLT_SEND`/`SerialCB` shim
+  through `WasmRunFrame` while `CB2_Overworld` runs, and hand off to the trade
+  (`CB2_StartCreateTradeMenu`) / battle callbacks. **Verify:** two players
+  complete a link trade and a link battle end to end.
+
+### M6 — Hardening ✅ done
+- **Relay lifecycle + abuse limits** (`web/relay.mjs`): per-connection message
+  rate limit (token bucket), max frame size, room idle-TTL reap, and unfilled-
+  room join-timeout reap. All overridable; defaults are generous so normal play
+  is unaffected. **Verify:** `node tools/wasm_relay_hardening.mjs` trips each
+  guard (oversized frame dropped, rate exceeded dropped, join-timeout and idle
+  rooms reaped).
+- **Latency tolerance** (`tools/wasm_relay_latency.mjs`): the relay can inject
+  per-message forwarding latency, and the M2 block round-trip + M3 desync run
+  through it unchanged. The key invariant: **establishment still happens at game
+  frame 7 regardless of latency** — lockstep is paced in frames, not
+  milliseconds, so latency only costs wall-clock time. On *input-delay* proper:
+  the per-transfer serial model can't pre-commit words (each staged word depends
+  on the previous transfer's RECV), so classic N-frame input-delay doesn't
+  apply; what makes it tolerable is that the game is turn-based and the bus
+  posts both peers' words for a transfer simultaneously (cost ≈ one-way delay,
+  not RTT). A jitter buffer is unnecessary because delivery is already
+  seq-keyed and order-preserving.
+- **Reconnect across transient drops** (`tools/wasm_relay_reconnect.mjs`): the
+  relay holds a dropped peer's slot for a grace window, buffers everything bound
+  for it, and replays it on resume (`{type:'join', resume:<id>}`); the transport
+  auto-reconnects, and both sides re-post any in-flight serial word (de-duped by
+  the `seq` guard) so no word is lost or duplicated. Proven correct with the M3
+  desync detector as the oracle: a forced mid-session drop completes **0,0 with
+  the detector quiet** — the wire transcript is bit-identical across the break.
+- **Continuous determinism on a richer scenario** (`tools/wasm_determinism.mjs
+  --scenario overworld`): uses the `WasmStartNewGame` shim to fingerprint a
+  running overworld (map load + field tasks + RNG), a far stronger
+  cross-machine determinism check than the title screen. Bit-identical across
+  instances; `--diverge-at` still trips. A save-loaded trade/battle scenario is
+  deferred with the rest of M5 to the browser (no headless overworld save yet).
+- Optional cross-machine/browser determinism check: still recommended as a
+  one-off (logic is integer `Div` + IEEE `Sqrt`), now easy via
+  `--emit golden.json` / `--compare golden.json --scenario overworld`.
 
 ## Explicitly out of scope (for now)
 
@@ -124,16 +242,24 @@ loaded save, complete a **link trade** and a **link battle** end to end.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Cross-machine state divergence | Low | Logic is integer-only; add M6 cross-machine check |
-| Latency makes lockstep feel sluggish | Medium | Input-delay buffer; turn-based game is forgiving |
-| Cable Club flow needs more shim surface than `OpenLink` | Medium | M5 spike before committing UI work |
-| Relay abuse / room squatting | Low | Room TTLs, max peers, rate limits in M6 |
+| Cross-machine state divergence | Low | Logic is integer-only; M6 added a richer overworld determinism scenario (`--scenario overworld`) + golden emit/compare for a one-off cross-machine check |
+| Latency makes lockstep feel sluggish | ~~Medium~~ Mitigated | M6 latency test confirms establishment stays at frame 7 under injected latency; lockstep is frame-paced, cost ≈ one-way delay, turn-based game is forgiving |
+| Cable Club flow needs more shim surface than `OpenLink` | ~~Medium~~ Retired | M5 spike proved the game drives `OpenLink` itself under the normal loop; the only "extra surface" is running the full game loop (no new transport code) |
+| Relay abuse / room squatting | ~~Low~~ Mitigated | M6 added per-connection rate limit, max frame size, room idle-TTL + join-timeout reap, max peers (see `wasm_relay_hardening.mjs`) |
 
 ## Reproduce the prototypes
 
 ```
 make wasm
-node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism
+node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism (title)
+node tools/wasm_determinism.mjs --scenario overworld --frames 600  # M6 overworld determinism
 node tools/wasm_link_loopback.mjs                             # M1 in-process bus
 node tools/wasm_link_relay.mjs                                # M2 cross-process relay
+node tools/wasm_link_desync.mjs                               # M3 desync detection
+node tools/wasm_netplay_check.mjs                             # M4 browser driver (headless)
+node web/server.mjs   # then open http://localhost:8000 in two tabs, same room  # M4 in-browser
+node tools/wasm_cable_club_spike.mjs                          # M5 spike (game-driven link)
+node tools/wasm_relay_hardening.mjs                           # M6 relay lifecycle/abuse limits
+node tools/wasm_relay_reconnect.mjs                           # M6 reconnect across a transient drop
+node tools/wasm_relay_latency.mjs --latency 12                # M6 latency tolerance (slow)
 ```

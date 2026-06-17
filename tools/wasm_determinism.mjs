@@ -176,7 +176,7 @@ function fnv1aWords(words) {
 function hex(n) { return (n >>> 0).toString(16).padStart(8, '0'); }
 
 // --- one instance -------------------------------------------------------------
-async function createInstance(module) {
+async function createInstance(module, scenario = 'title') {
   // The module declares and exports its own memory, so imports read it lazily
   // via a getter rather than us supplying a Memory object.
   let inst;
@@ -185,6 +185,11 @@ async function createInstance(module) {
   const u16 = () => new Uint16Array(inst.exports.memory.buffer);
 
   inst.exports.AgbMain();
+  // The 'overworld' scenario jumps straight into a fresh game's overworld via
+  // the WASM bring-up shim (see src/main.c), exercising map load + field tasks +
+  // the RNG far more than the title/intro the default scenario churns — a much
+  // stronger continuous determinism check for the netplay guarantee.
+  if (scenario === 'overworld') inst.exports.WasmStartNewGame();
 
   // [0, __data_end) is the entire static data + bss + game heap = full state.
   const dataEnd = inst.exports.__data_end.value >>> 0;
@@ -211,10 +216,14 @@ async function createInstance(module) {
 }
 
 // --- input script -------------------------------------------------------------
-// A deterministic schedule of held buttons by frame. Exercises title/intro,
-// which churn the RNG and a lot of game logic — enough to expose nondeterminism.
-function scriptedKeyMask(frame) {
-  // Mash A then START in alternating bursts to advance intro screens.
+// A deterministic schedule of held buttons by frame, per scenario. Both churn
+// the RNG and a lot of game logic — enough to expose nondeterminism.
+function scriptedKeyMask(frame, scenario = 'title') {
+  if (scenario === 'overworld') {
+    // Advance the new-game truck/Mom dialogue with periodic A taps.
+    return (frame % 24 < 2) ? buttons.a : 0;
+  }
+  // title/intro: mash A then START in alternating bursts to advance screens.
   const phase = Math.floor(frame / 30) % 4;
   if (phase === 0) return buttons.a;
   if (phase === 2) return buttons.start;
@@ -222,7 +231,7 @@ function scriptedKeyMask(frame) {
 }
 
 function parseArgs(argv) {
-  const o = { frames: 2000, instances: 2, wasm: 'build/wasm/pokeemerald.wasm', emit: null, compare: null, divergeAt: -1 };
+  const o = { frames: 2000, instances: 2, wasm: 'build/wasm/pokeemerald.wasm', emit: null, compare: null, divergeAt: -1, scenario: 'title' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--frames') o.frames = Number(argv[++i]);
@@ -230,6 +239,7 @@ function parseArgs(argv) {
     else if (a === '--wasm') o.wasm = argv[++i];
     else if (a === '--emit') o.emit = argv[++i];
     else if (a === '--compare') o.compare = argv[++i];
+    else if (a === '--scenario') o.scenario = argv[++i]; // 'title' (default) | 'overworld'
     // Negative control: feed instance 1 a different button on this one frame.
     // The run MUST then report divergence — proves the detector has teeth.
     else if (a === '--diverge-at') o.divergeAt = Number(argv[++i]);
@@ -245,11 +255,11 @@ async function main() {
   const module = await WebAssembly.compile(bytes);
 
   console.log(`wasm: ${wasmPath} (${(bytes.length / 1024 / 1024).toFixed(1)} MiB)`);
-  console.log(`frames: ${opts.frames}, instances: ${opts.instances}`);
+  console.log(`frames: ${opts.frames}, instances: ${opts.instances}, scenario: ${opts.scenario}`);
   console.log('booting instances (AgbMain)...');
 
   const instances = [];
-  for (let i = 0; i < opts.instances; i++) instances.push(await createInstance(module));
+  for (let i = 0; i < opts.instances; i++) instances.push(await createInstance(module, opts.scenario));
 
   console.log(`state region: [0, 0x${instances[0].dataEnd.toString(16)}) = ${(instances[0].dataEnd / 1048576).toFixed(1)} MiB`);
 
@@ -265,7 +275,7 @@ async function main() {
   const distinctVideoHashes = new Set();
 
   for (let frame = 0; frame < opts.frames; frame++) {
-    const keyMask = scriptedKeyMask(frame);
+    const keyMask = scriptedKeyMask(frame, opts.scenario);
     for (let i = 0; i < instances.length; i++) {
       // Optional perturbation for the negative control.
       const k = (i === 1 && frame === opts.divergeAt) ? buttons.right : keyMask;
