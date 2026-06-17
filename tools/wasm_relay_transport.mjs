@@ -80,6 +80,10 @@ export class RelayTransport {
     } else if (m.type === 'hash') {
       this.peerHashes.set(m.key, m.hash >>> 0);
       this._compare(m.key);
+    } else if (m.type === 'desync') {
+      // The peer detected the mismatch first and is telling us, so both sides
+      // alarm even if a disconnect would otherwise race the local compare.
+      if (!this.desync) this.desync = { key: m.key, local: m.peer >>> 0, peer: m.local >>> 0 };
     } else if (m.type === 'finishAck') {
       this._finishAcked = true;
       if (this._finishAckWaiter) { const w = this._finishAckWaiter; this._finishAckWaiter = null; w(); }
@@ -105,7 +109,10 @@ export class RelayTransport {
     const peer = this.peerHashes.get(key);
     this.localHashes.delete(key);
     this.peerHashes.delete(key);
-    if (local !== peer && !this.desync) this.desync = { key, local, peer };
+    if (local !== peer && !this.desync) {
+      this.desync = { key, local, peer };
+      this._post({ type: 'desync', key, local, peer }); // notify the peer immediately
+    }
   }
 
   // End-of-run handshake so a clean run can prove EVERY checkpoint was compared:

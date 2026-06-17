@@ -13,14 +13,14 @@ verifiable.
 | M1 — Reusable SIO bus module | ✅ done |
 | M2 — WebSocket relay transport | ✅ done |
 | M3 — Desync detection | ✅ done |
-| M4 — Browser integration | ⬜ next |
-| M5 — Drive from the in-game Cable Club | ⬜ |
+| M4 — Browser integration | ✅ done |
+| M5 — Drive from the in-game Cable Club | ⬜ next |
 | M6 — Hardening | ⬜ |
 
-The link cable now works in-process (M1) and across two OS processes over real
-WebSockets (M2), both with no game-code changes, and a lockstep desync detector
-(M3) catches any divergence between peers. Run them with the commands in
-[Reproduce the prototypes](#reproduce-the-prototypes).
+The link cable now works in-process (M1), across two OS processes over real
+WebSockets (M2), and **in the browser** (M4) — all with no game-code changes —
+with a lockstep desync detector (M3) catching any divergence between peers. Run
+them with the commands in [Reproduce the prototypes](#reproduce-the-prototypes).
 
 ## Guiding constraints
 
@@ -113,16 +113,32 @@ stronger than M2's per-frame transfer-*count* tripwire.
   determinism harness's `--diverge-at` independently demonstrates the same
   detector logic against real state divergence in-process.
 
-### M4 — Browser integration (`web/app.js`)
-- Add the SIO shim around `WasmRunFrame()`: read this peer's
-  `REG_SIOMLT_SEND`, push to the transport, await peers, deliver `RECV`, call
-  `SerialCB`. Gate it on an "online" mode so single-player is unaffected.
-- Minimal connect UI (host/join a room code).
-- Reuse M3 directly: the browser session holds a `SioBus` + `RelayTransport`, so
-  it can call `transport.checkpointHash(frame, bus.transcript)` on the same
-  cadence to get desync detection in the tab for free.
-- **Verify:** two browser tabs reach `CONN_ESTABLISHED` and exchange a block,
-  mirroring the loopback in-browser.
+### M4 — Browser integration ✅ done
+The browser now runs the *same* SIO stack the headless tooling does — no second
+implementation. The key realization: `tools/wasm_sio_bus.mjs` and
+`tools/wasm_relay_transport.mjs` use only browser-safe globals (`WebSocket`,
+`JSON`, `Math`), and `web/app.js` is already an ES module, so the browser imports
+them directly (the dev server serves the repo root; `.mjs` now maps to a JS MIME
+type in `web/server.mjs`).
+
+- `web/netplay.mjs`: an environment-agnostic online-session driver. It takes an
+  injected `rt` (the live wasm instance), a `present()` callback (render + yield
+  to the browser between steps), and a room code, then runs the relay client's
+  exact flow — connect, bring the link up, reach `CONN_ESTABLISHED`, round-trip a
+  64-byte block — sampling `bus.transcript` every 16 frames for **M3 desync
+  detection in the tab**.
+- `web/app.js`: an `rt` adapter over the running instance (the same shape
+  `wasm_gba_runtime.mjs` returns), plus an "online" mode that suspends the
+  single-player tick (by bumping `bootId`) and lets the session drive rendering.
+  Single-player is untouched until you connect; disconnecting reboots it.
+- `web/index.html` / `style.css`: a minimal connect panel (room code + a
+  Connect/Disconnect button) and a dedicated status line.
+- **Verify:** open two tabs, type the same room code in both, click Connect —
+  both reach `CONN_ESTABLISHED` and the block round-trips, mirroring the
+  loopback in-browser. Two real tabs can't run in CI, so the same browser driver
+  is exercised headlessly by `tools/wasm_netplay_check.mjs` (two peers through
+  `web/netplay.mjs` over the in-process relay): establishment at frame 7, block
+  intact, 17 desync checkpoints in sync.
 
 ### M5 — Drive from the in-game Cable Club
 Replace the programmatic `OpenLink` bring-up with the real flow: walk to a
@@ -163,4 +179,6 @@ node tools/wasm_determinism.mjs --frames 1500 --instances 3   # determinism
 node tools/wasm_link_loopback.mjs                             # M1 in-process bus
 node tools/wasm_link_relay.mjs                                # M2 cross-process relay
 node tools/wasm_link_desync.mjs                               # M3 desync detection
+node tools/wasm_netplay_check.mjs                             # M4 browser driver (headless)
+node web/server.mjs   # then open http://localhost:8000 in two tabs, same room  # M4 in-browser
 ```

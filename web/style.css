@@ -235,6 +235,41 @@ button.pressed {
   white-space: nowrap;
 }
 
+.netplay {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: clamp(8px, 1.5vmin, 14px);
+}
+
+.netplay label {
+  color: #9bf2cc;
+  font-size: clamp(12px, 2.2vmin, 18px);
+  font-weight: 700;
+}
+
+#room-code {
+  min-width: 0;
+  min-height: clamp(38px, 8vmin, 68px);
+  border: 0;
+  border-radius: 999px;
+  padding: 0 clamp(12px, 2.4vmin, 20px);
+  color: #20140b;
+  background: #e9efe9;
+  font: inherit;
+  font-size: clamp(13px, 2.2vmin, 18px);
+  font-weight: 700;
+}
+
+#room-code:disabled {
+  opacity: .6;
+}
+
+.netplay-status {
+  color: #f1cf62;
+}
+
 .speed-control label {
   display: flex;
   justify-content: space-between;

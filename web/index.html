@@ -58,7 +58,15 @@
         <label class="upload-save" for="upload-save">Upload .sav</label>
         <input id="upload-save" type="file" accept=".sav,.srm,application/octet-stream" />
       </div>
+
+      <div class="netplay" aria-label="Online link (experimental)">
+        <label for="room-code">Link room</label>
+        <input id="room-code" type="text" inputmode="latin" autocomplete="off" placeholder="room code" />
+        <button id="connect" type="button">Connect</button>
+      </div>
     </section>
+
+    <div class="status netplay-status" id="netplay-status">Online link: enter a shared room code in two tabs to connect.</div>
 
     <p class="keys">Keyboard: arrows, Z=A, X=B, Enter=Start, Shift=Select.</p>
   </main>

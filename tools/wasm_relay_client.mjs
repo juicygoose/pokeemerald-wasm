@@ -100,9 +100,17 @@ async function main() {
 
   let code;
   if (opts.mode === 'desync') {
-    const res = role === 'master'
-      ? await runMasterDesync(bus, transport, log, establishedAt, opts)
-      : await runSlaveDesync(bus, transport, log, opts);
+    let res;
+    try {
+      res = role === 'master'
+        ? await runMasterDesync(bus, transport, log, establishedAt, opts)
+        : await runSlaveDesync(bus, transport, log, opts);
+    } catch (e) {
+      // A peer that detects desync may drop the socket while we're mid-transfer;
+      // if we already know it desynced, that's the alarm, not a crash.
+      if (!transport.desync) throw e;
+      res = reportDesync(transport, log, 0);
+    }
     code = res === 'desync' ? 3 : 0; // 3 = desync alarm fired (distinct from crash)
   } else {
     const ok = role === 'master'

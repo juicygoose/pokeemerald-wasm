@@ -1,3 +1,5 @@
+import { runOnlineSession, relayUrl } from './netplay.mjs';
+
 const WIDTH = 240;
 const HEIGHT = 160;
 const REG = 0x04000000;
@@ -53,6 +55,9 @@ const speedInput = document.querySelector('#speed');
 const speedValue = document.querySelector('#speed-value');
 const downloadSaveButton = document.querySelector('#download-save');
 const uploadSaveInput = document.querySelector('#upload-save');
+const roomInput = document.querySelector('#room-code');
+const connectButton = document.querySelector('#connect');
+const netStatusEl = document.querySelector('#netplay-status');
 const ctx = canvas.getContext('2d');
 const image = ctx.createImageData(WIDTH, HEIGHT);
 const layerData = new Uint8Array(WIDTH * HEIGHT);
@@ -63,6 +68,7 @@ let instance;
 let memory;
 let u8;
 let u16;
+let u32;
 let statusText = 'loading wasm…';
 let lastFpsUpdate = performance.now();
 let lastTick = performance.now();
@@ -75,6 +81,7 @@ let lastSavedFlashHash = 0;
 let lastSaveFlushTime = performance.now();
 let wasmModulePromise;
 let bootId = 0;
+let onlineActive = false;
 let automationReady;
 let resolveAutomationReady;
 if (automate) {
@@ -84,6 +91,7 @@ if (automate) {
 function refreshViews() {
   u8 = new Uint8Array(memory.buffer);
   u16 = new Uint16Array(memory.buffer);
+  u32 = new Uint32Array(memory.buffer);
 }
 
 function bytesToBase64(bytes) {
@@ -986,6 +994,106 @@ function tick(thisBootId, now) {
     statusEl.textContent = error.stack || String(error);
   }
 }
+
+// --- Online (netplay) mode — M4 of docs/netplay-next-steps.md ----------------
+// An `rt` adapter exposing the live wasm instance to the shared SIO stack (the
+// same shape tools/wasm_gba_runtime.mjs returns for the headless tooling).
+function makeRt() {
+  return {
+    get exports() { return instance.exports; },
+    rd8: (p) => u8[p],
+    rd16: (p) => u16[p >> 1],
+    rd32: (p) => u32[p >> 2],
+    wr8: (p, v) => { u8[p] = v & 0xff; },
+    wr16: (p, v) => { u16[p >> 1] = v & 0xffff; },
+    wr32: (p, v) => { u32[p >> 2] = v >>> 0; },
+    bytes: (p, n) => u8.slice(p, p + n),
+    addrOf: (name) => instance.exports[name].value >>> 0,
+    setKeys: (mask) => { u16[KEYINPUT >> 1] = KEY_MASK ^ (mask & KEY_MASK); },
+    runFrame: () => instance.exports.WasmRunFrame(),
+  };
+}
+
+function heldKeyMask() {
+  let held = 0;
+  for (const key of pressed) held |= buttons[key] || 0;
+  for (const key of pendingPresses.keys()) held |= buttons[key] || 0;
+  return held & KEY_MASK;
+}
+
+const nextRaf = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+function netStatus(text) {
+  if (netStatusEl) netStatusEl.textContent = text;
+}
+
+function updateNetUI() {
+  if (connectButton) connectButton.textContent = onlineActive ? 'Disconnect' : 'Connect';
+  if (roomInput) roomInput.disabled = onlineActive;
+}
+
+// Boot a fresh instance and drive a lockstep link session against the peer in
+// the room. The normal single-player tick is suspended (bumping bootId stops
+// it); the session renders each frame itself via `present`.
+async function connectOnline(room) {
+  onlineActive = true;
+  updateNetUI();
+  const thisBootId = ++bootId;
+  pressed.clear();
+  pendingPresses.clear();
+
+  netStatus('booting link instance…');
+  const { module } = await wasmModule();
+  instance = await WebAssembly.instantiate(module, importsFor(module));
+  memory = instance.exports.memory;
+  window.pokeemerald = { instance, memory, runFrames };
+  refreshViews();
+  writeKeys();
+  instance.exports.AgbMain();
+  currentFrame = 0;
+  statusEl.textContent = `online — linked session in room "${room}"`;
+
+  await runOnlineSession({
+    rt: makeRt(),
+    room,
+    url: relayUrl(),
+    getKeys: heldKeyMask,
+    onStatus: netStatus,
+    present: async () => { render(); await nextRaf(); },
+    shouldStop: () => !onlineActive || bootId !== thisBootId,
+  });
+
+  // Session ended (completed or disconnected). Return to single-player unless a
+  // newer connect/boot has already taken over.
+  onlineActive = false;
+  updateNetUI();
+  if (bootId === thisBootId) await boot();
+}
+
+function toggleOnline() {
+  if (onlineActive) {
+    onlineActive = false; // the in-flight session will observe this and stop
+    updateNetUI();
+    netStatus('disconnecting…');
+    return;
+  }
+  const room = (roomInput?.value || '').trim();
+  if (!room) { netStatus('enter a room code to connect'); return; }
+  connectOnline(room).catch((error) => {
+    console.error(error);
+    onlineActive = false;
+    updateNetUI();
+    netStatus(`❌ ${error.message || error}`);
+  });
+}
+
+if (connectButton) connectButton.addEventListener('click', toggleOnline);
+if (roomInput) {
+  roomInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); toggleOnline(); }
+  });
+}
+updateNetUI();
 
 boot().catch((error) => {
   console.error(error);
