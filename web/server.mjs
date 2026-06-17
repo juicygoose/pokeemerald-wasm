@@ -1,6 +1,7 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
 import { createServer } from 'node:http';
+import { Relay } from './relay.mjs';
 
 const root = resolve(process.cwd());
 const requestedPort = Number(process.env.PORT || 8000);
@@ -18,7 +19,7 @@ function fileFor(url) {
   return file.startsWith(root) ? file : null;
 }
 
-createServer((req, res) => {
+const server = createServer((req, res) => {
   const file = fileFor(req.url);
   if (!file || !existsSync(file) || !statSync(file).isFile()) {
     res.writeHead(404).end('not found');
@@ -30,7 +31,12 @@ createServer((req, res) => {
     'Cache-Control': 'no-store',
   });
   createReadStream(file).pipe(res);
-}).listen(requestedPort, function () {
+});
+
+// Netplay room relay shares the port via WebSocket upgrades (see web/relay.mjs).
+new Relay({ log: (m) => console.log(`[relay] ${m}`) }).attach(server);
+
+server.listen(requestedPort, function () {
   const { port } = this.address();
-  console.log(`pokeemerald wasm server: http://localhost:${port}`);
+  console.log(`pokeemerald wasm server: http://localhost:${port} (ws relay on same port)`);
 });
