@@ -26,6 +26,12 @@ itself; finishing a full trade/battle is the remaining browser work. Run
 everything with the commands in
 [Reproduce the prototypes](#reproduce-the-prototypes).
 
+> **What's left** is tracked in
+> [`netplay-remaining-work.md`](./netplay-remaining-work.md): finishing M5's full
+> link trade + battle in the browser, plus optional follow-ups (headless trade
+> determinism, browser reconnect UI, 3–4-player link, relay productionization).
+> The transport stack itself is complete.
+
 ## Guiding constraints
 
 - **No game-logic changes.** Keep all multiplayer in JS + WASM-only shims, as
